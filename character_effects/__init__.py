@@ -1,18 +1,18 @@
-"""Independent face blush, water droplets and smooth oil highlights."""
+"""Independent character surface effects and adjustable face makeup."""
 bl_info = {
-    'name': '角色脸红、水渍与油',
+    'name': '角色特效与妆造',
     'author': 'ruomuanshi',
-    'version': (1, 5, 0),
+    'version': (1, 6, 0),
     'blender': (5, 2, 0),
     'location': '3D 视图 > 侧栏 > 角色特效',
-    'description': '为角色自动添加脸红、水渍和油光',
+    'description': '为角色添加脸红、眼影、口红、水渍、油光与沐浴露',
     'category': 'Material',
 }
 
 import bpy
 from bpy.props import BoolProperty, EnumProperty, FloatProperty, FloatVectorProperty, IntProperty, PointerProperty, StringProperty
 
-from . import blush, wet, oil, water_surface, bath
+from . import blush, wet, oil, water_surface, bath, makeup
 
 
 FRONT_DIRECTIONS = [
@@ -21,6 +21,16 @@ FRONT_DIRECTIONS = [
     ('NEG_X', '−X', ''), ('POS_X', '＋X', ''),
 ]
 
+
+
+def update_makeup(settings, context):
+    obj = active_mesh(context) if context else None
+    if not obj or not obj.data.attributes.get(makeup.COORDS):
+        return
+    for slot in obj.material_slots:
+        mat = slot.material
+        if mat and not mat.library and mat.get('bt_makeup_active'):
+            makeup.configure(mat, settings)
 
 
 class CharacterEffectsSettings(bpy.types.PropertyGroup):
@@ -76,6 +86,25 @@ class CharacterEffectsSettings(bpy.types.PropertyGroup):
     bath_material: PointerProperty(name='额外应用材质', type=bpy.types.Material)
     bath_mask: PointerProperty(name='沐浴露遮罩', type=bpy.types.Image)
     bath_uv: StringProperty(name='遮罩 UV', description='留空使用活动 UV；流痕贴图使用角色 UV')
+    makeup_eye_enabled: BoolProperty(name='眼影', default=True, update=update_makeup)
+    makeup_eye_color: FloatVectorProperty(name='眼影颜色', subtype='COLOR', size=4,
+        default=(.22, .045, .10, 1), min=0, max=1, update=update_makeup)
+    makeup_eye_amount: FloatProperty(name='眼影浓度', default=.45, min=0, max=1, update=update_makeup)
+    makeup_lip_enabled: BoolProperty(name='口红', default=True, update=update_makeup)
+    makeup_lip_color: FloatVectorProperty(name='口红颜色', subtype='COLOR', size=4,
+        default=(.55, .025, .055, 1), min=0, max=1, update=update_makeup)
+    makeup_lip_amount: FloatProperty(name='口红浓度', default=.65, min=0, max=1, update=update_makeup)
+    makeup_eye_spacing: FloatProperty(name='眼影间距', default=.21, min=.02, max=.45, update=update_makeup)
+    makeup_eye_height: FloatProperty(name='眼影高度', default=.63, min=0, max=1, update=update_makeup)
+    makeup_eye_width: FloatProperty(name='眼影宽度', default=.14, min=.005, max=.35, update=update_makeup)
+    makeup_eye_radius: FloatProperty(name='眼影纵向范围', default=.06, min=.005, max=.25, update=update_makeup)
+    makeup_lip_height: FloatProperty(name='口红高度', default=.26, min=0, max=1, update=update_makeup)
+    makeup_lip_width: FloatProperty(name='口红宽度', default=.10, min=.005, max=.30, update=update_makeup)
+    makeup_lip_radius: FloatProperty(name='口红纵向范围', default=.025, min=.002, max=.15, update=update_makeup)
+    makeup_softness: FloatProperty(name='妆容柔边', default=.65, min=.01, max=1, update=update_makeup)
+    makeup_eye_mask: PointerProperty(name='眼影灰度遮罩', type=bpy.types.Image, update=update_makeup)
+    makeup_lip_mask: PointerProperty(name='口红灰度遮罩', type=bpy.types.Image, update=update_makeup)
+    makeup_uv: StringProperty(name='妆容遮罩 UV', update=update_makeup)
     show_advanced: BoolProperty(name='高级设置', default=False)
 
 
@@ -362,6 +391,85 @@ class CHARACTERFX_OT_remove_bath(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class CHARACTERFX_OT_apply_makeup(bpy.types.Operator):
+    bl_idname = 'characterfx.apply_makeup'
+    bl_label = '添加／更新妆造'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return active_mesh(context) is not None
+
+    def execute(self, context):
+        obj = active_mesh(context)
+        settings = context.scene.character_effects
+        targets = target_materials(obj, is_face_material, settings)
+        if not targets:
+            self.report({'ERROR'}, '未识别到脸部材质，可在高级设置指定额外脸部材质')
+            return {'CANCELLED'}
+        indices = {i for i, slot in enumerate(obj.material_slots)
+                   if slot.material and is_face_material(slot.material, settings)}
+        try:
+            if obj.library or obj.data.library:
+                raise ValueError('链接网格不可编辑，请先创建本地副本')
+            if not obj.data.get('bt_makeup_fitted'):
+                makeup.fit(obj, indices, settings)
+            makeup.prepare(obj, indices, settings)
+        except ValueError as error:
+            self.report({'ERROR'}, str(error))
+            return {'CANCELLED'}
+        count = sum(bool(makeup.configure(mat, settings)) for _, mat in targets if not mat.library)
+        if not count:
+            self.report({'ERROR'}, '脸部着色器需要提供 Base Color 输入')
+            return {'CANCELLED'}
+        self.report({'INFO'}, f'已为 {count} 个脸部材质添加妆造；颜色和浓度可直接调整')
+        return {'FINISHED'}
+
+
+class CHARACTERFX_OT_fit_makeup(bpy.types.Operator):
+    bl_idname = 'characterfx.fit_makeup'
+    bl_label = '自动定位眼唇'
+    bl_description = '从脸部开口估计眼睛和嘴唇位置；无法识别时使用脸部比例，可手动微调'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return active_mesh(context) is not None
+
+    def execute(self, context):
+        obj = active_mesh(context)
+        settings = context.scene.character_effects
+        indices = {i for i, slot in enumerate(obj.material_slots)
+                   if slot.material and is_face_material(slot.material, settings)}
+        try:
+            if obj.library or obj.data.library:
+                raise ValueError('链接网格不可编辑，请先创建本地副本')
+            makeup.fit(obj, indices, settings)
+        except ValueError as error:
+            self.report({'ERROR'}, str(error))
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
+class CHARACTERFX_OT_remove_makeup(bpy.types.Operator):
+    bl_idname = 'characterfx.remove_makeup'
+    bl_label = '移除妆造'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return active_mesh(context) is not None
+
+    def execute(self, context):
+        obj = active_mesh(context)
+        for slot in obj.material_slots:
+            if slot.material and not slot.material.library:
+                makeup.disconnect(slot.material)
+        if not obj.library and not obj.data.library:
+            makeup.cleanup(obj)
+        return {'FINISHED'}
+
+
 class CHARACTERFX_PT_panel(bpy.types.Panel):
     bl_label = '角色效果'
     bl_idname = 'CHARACTERFX_PT_panel'
@@ -383,6 +491,17 @@ class CHARACTERFX_PT_panel(bpy.types.Panel):
         row = blush_box.row(align=True)
         row.operator('characterfx.apply_blush', icon='ADD')
         row.operator('characterfx.remove_blush', icon='REMOVE')
+
+        box = layout.box()
+        box.label(text='基础妆造', icon='BRUSH_DATA')
+        for effect in ('eye', 'lip'):
+            row = box.row(align=True)
+            row.prop(settings, 'makeup_'+effect+'_enabled')
+            row.prop(settings, 'makeup_'+effect+'_color', text='')
+            box.prop(settings, 'makeup_'+effect+'_amount', slider=True)
+        row = box.row(align=True)
+        row.operator('characterfx.apply_makeup', icon='ADD')
+        row.operator('characterfx.remove_makeup', icon='REMOVE')
 
         water_box = layout.box()
         water_box.label(text='水渍', icon='MATERIAL')
@@ -421,6 +540,15 @@ class CHARACTERFX_PT_panel(bpy.types.Panel):
                 box.prop(settings, name)
             box.prop(settings, 'blush_material')
             box = layout.box()
+            box.label(text='妆造位置与遮罩')
+            box.operator('characterfx.fit_makeup')
+            for name in ('makeup_eye_spacing', 'makeup_eye_height', 'makeup_eye_width',
+                         'makeup_eye_radius', 'makeup_lip_height', 'makeup_lip_width',
+                         'makeup_lip_radius', 'makeup_softness', 'makeup_eye_mask',
+                         'makeup_lip_mask', 'makeup_uv'):
+                box.prop(settings, name)
+            box.label(text='正面方向与额外脸部材质沿用脸红设置')
+            box = layout.box()
             box.label(text='水渍')
             for name in ('wet_streams', 'wet_length', 'wet_width', 'wet_thickness', 'wet_roughness',
                          'wet_refraction', 'wet_seed', 'wet_face', 'wet_mask', 'wet_uv'):
@@ -448,6 +576,9 @@ CLASSES = (
     CHARACTERFX_OT_remove_oil,
     CHARACTERFX_OT_apply_bath,
     CHARACTERFX_OT_remove_bath,
+    CHARACTERFX_OT_apply_makeup,
+    CHARACTERFX_OT_fit_makeup,
+    CHARACTERFX_OT_remove_makeup,
     CHARACTERFX_PT_panel,
 )
 
