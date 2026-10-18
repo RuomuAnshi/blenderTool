@@ -24,6 +24,8 @@ FRONT_DIRECTIONS = [
 
 
 def update_makeup(settings, context):
+    if not context or settings.id_data != context.scene:
+        return
     obj = active_mesh(context) if context else None
     if not obj or not obj.data.attributes.get(makeup.COORDS):
         return
